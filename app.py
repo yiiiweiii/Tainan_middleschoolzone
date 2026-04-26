@@ -8,7 +8,14 @@ import zipfile
 import io
 
 app = Flask(__name__)
+@app.route("/")
+def home():
+    return "✅ 府城覓好宅大腦：連線正常！"
 
+@app.route("/test")
+def test():
+    print("📢 偵測到有人敲門！")
+    return "測試成功！"
 # ==========================================
 # 🔑 LINE 兩把鑰匙已綁定完成！
 # ==========================================
