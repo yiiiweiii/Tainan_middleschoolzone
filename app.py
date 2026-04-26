@@ -2,9 +2,10 @@ from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
-import pandas as pd
+import csv
 import re
 import zipfile
+import io
 
 app = Flask(__name__)
 
@@ -16,7 +17,7 @@ line_bot_api = LineBotApi(
 handler = WebhookHandler('22c3dcc8f543c87d53cde3e8291de9fa')
 
 # ==========================================
-# 1. 資料載入 (跟原本網頁版一樣的邏輯)
+# 1. 輕量化資料載入 (不使用 pandas，解決記憶體爆滿問題)
 # ==========================================
 DISTRICT_MAP = {
     '6700100': '新營區', '6700200': '鹽水區', '6700300': '白河區', '6700400': '柳營區', '6700500': '後壁區',
@@ -29,48 +30,51 @@ DISTRICT_MAP = {
     '6703600': '安平區', '6703700': '中西區'
 }
 
-# 在系統啟動時先載入資料，這樣機器人回覆才會快
-addr_df = pd.DataFrame()
+
+def to_hw(t):
+    if not t: return ""
+    return str(t).translate(str.maketrans('０１２３４５６７８９', '0123456789')).strip()
+
+
+addr_list = []
 try:
     with zipfile.ZipFile("address.csv.zip", "r") as z:
         csv_filename = [name for name in z.namelist() if not name.startswith("__MACOSX") and name.endswith(".csv")][0]
         with z.open(csv_filename) as f:
-            addr_df = pd.read_csv(f, dtype=str)
-    addr_df.fillna('', inplace=True)
-    addr_df['區'] = addr_df['鄉鎮市區代碼'].map(DISTRICT_MAP)
-
-
-    def to_hw(t):
-        return str(t).translate(str.maketrans('０１２３４５６７８９', '0123456789')).strip()
-
-
-    for col in ['街、路段', '巷', '弄', '號', '鄰']: addr_df[col] = addr_df[col].apply(to_hw)
-    addr_df['標準地址'] = addr_df['區'] + addr_df['街、路段'] + addr_df['巷'] + addr_df['弄'] + addr_df['號']
-except:
-    pass
+            reader = csv.DictReader(io.TextIOWrapper(f, encoding='utf-8-sig'))
+            for row in reader:
+                dist_code = row.get('鄉鎮市區代碼', '')
+                dist_name = DISTRICT_MAP.get(dist_code, '')
+                street = to_hw(row.get('街、路段', ''))
+                lane = to_hw(row.get('巷', ''))
+                alley = to_hw(row.get('弄', ''))
+                num = to_hw(row.get('號', ''))
+                neigh = to_hw(row.get('鄰', ''))
+                vill = row.get('村里', '').strip()
+                std_addr = f"{dist_name}{street}{lane}{alley}{num}"
+                addr_list.append({'標準地址': std_addr, '區': dist_name, '村里': vill, '鄰': neigh})
+except Exception as e:
+    print("Address loaded failed:", e)
 
 
 def load_rules(file_name):
     rules_data = {}
     try:
-        try:
-            rules_df = pd.read_csv(file_name, encoding='utf-8-sig')
-        except:
-            rules_df = pd.read_csv(file_name, encoding='big5')
-        rules_df.columns = rules_df.columns.str.strip()
-        for _, row in rules_df.iterrows():
-            if pd.isna(row.get('行政區')): continue
-            dist = str(row['行政區']).strip()
-            vill = str(row['里別']).strip()
-            if not vill.endswith('里'): vill += '里'
-            neigh = str(row['鄰別']).strip()
-            school_text = str(row['基本學區']).strip()
-            if dist not in rules_data: rules_data[dist] = {}
-            if vill not in rules_data[dist]: rules_data[dist][vill] = {}
-            rules_data[dist][vill][neigh] = school_text
-        return rules_data
+        with open(file_name, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                dist = str(row.get('行政區', '')).strip()
+                vill = str(row.get('里別', '')).strip()
+                if not dist or not vill: continue
+                if not vill.endswith('里'): vill += '里'
+                neigh = str(row.get('鄰別', '')).strip()
+                school_text = str(row.get('基本學區', '')).strip()
+                if dist not in rules_data: rules_data[dist] = {}
+                if vill not in rules_data[dist]: rules_data[dist][vill] = {}
+                rules_data[dist][vill][neigh] = school_text
     except:
-        return {}
+        pass
+    return rules_data
 
 
 elem_dict = load_rules("elementary school zone.csv")
@@ -112,7 +116,7 @@ def find_school_info(dist, vill, n_num_str, rules_data):
 
 
 # ==========================================
-# 2. LINE 接線生 (Webhook) 接收訊息的通道
+# 2. LINE 接線生 (Webhook)
 # ==========================================
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -132,7 +136,6 @@ def callback():
 def handle_message(event):
     user_input = event.message.text
 
-    # 解析地址
     q = user_input.translate(str.maketrans('０１２３４５６７８９', '0123456789')).replace(" ", "").replace("台南市", "").replace(
         "臺南市", "")
     q = re.sub(r'^[\(\[]?\d{3,6}[\)\]]?', '', q)
@@ -142,22 +145,28 @@ def handle_message(event):
     elif "樓" in search_q:
         search_q = search_q.split("樓")[0]
 
-    # 搜尋門牌
-    match = addr_df[addr_df['標準地址'] == search_q]
-    if match.empty:
-        match = addr_df[addr_df['標準地址'].str.contains(search_q, na=False, regex=False)]
-    if match.empty and search_q.endswith("號"):
-        match = addr_df[addr_df['標準地址'].str.contains(search_q[:-1], na=False, regex=False)]
+    match_res = None
+    for item in addr_list:
+        if item['標準地址'] == search_q:
+            match_res = item
+            break
+    if not match_res:
+        for item in addr_list:
+            if search_q in item['標準地址']:
+                match_res = item
+                break
+    if not match_res and search_q.endswith("號"):
+        sq_no_num = search_q[:-1]
+        for item in addr_list:
+            if sq_no_num in item['標準地址']:
+                match_res = item
+                break
 
-    if not match.empty:
-        res = match.iloc[0]
-        # 查國小
-        e_basic, e_shared = find_school_info(res['區'], res['村里'], res['鄰'], elem_dict)
-        # 查國中
-        j_basic, j_shared = find_school_info(res['區'], res['村里'], res['鄰'], juni_dict)
+    if match_res:
+        e_basic, e_shared = find_school_info(match_res['區'], match_res['村里'], match_res['鄰'], elem_dict)
+        j_basic, j_shared = find_school_info(match_res['區'], match_res['村里'], match_res['鄰'], juni_dict)
 
-        # 準備回覆給客人的文字
-        reply_msg = f"🏠 【地址精準定位】\n台南市{res['標準地址']}\n行政區：{res['區']} / {res['村里']} / {res['鄰']}鄰\n"
+        reply_msg = f"🏠 【地址精準定位】\n台南市{match_res['標準地址']}\n行政區：{match_res['區']} / {match_res['村里']} / {match_res['鄰']}鄰\n"
         reply_msg += f"──────────\n"
         reply_msg += f"🎒 【國小學區】\n基本：{e_basic}\n共同：{e_shared}\n\n"
         reply_msg += f"🎓 【國中學區】\n基本：{j_basic}\n共同：{j_shared}\n"
@@ -166,7 +175,6 @@ def handle_message(event):
     else:
         reply_msg = f"❌ 找不到與「{user_input}」相符的門牌，請確認路名、巷弄是否輸入正確喔！"
 
-    # 把訊息傳回去給客人
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_msg))
 
 
